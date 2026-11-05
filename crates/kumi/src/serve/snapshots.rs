@@ -30,15 +30,39 @@ const FLUSH: Duration = Duration::from_secs(5);
 /// The writer's result for one write: whether its file is on disk.
 type Written = tokio::sync::oneshot::Sender<std::io::Result<()>>;
 
+/// An already queued, ordered write. Dropping this handle never cancels that write.
+#[must_use = "await the queued write's actual outcome; dropping it does not cancel it"]
+pub(super) struct PendingWrite {
+    seq: u64,
+    written: tokio::sync::oneshot::Receiver<std::io::Result<()>>,
+}
+
+impl PendingWrite {
+    pub(super) async fn wait(self) -> std::io::Result<u64> {
+        self.written.await.map_err(|_| std::io::Error::other("the snapshot writer stopped"))??;
+        Ok(self.seq)
+    }
+}
+
+#[cfg(test)]
+struct CommitGate {
+    entered: tokio::sync::oneshot::Sender<()>,
+    release: Receiver<()>,
+}
+
+struct FileWrite {
+    path: PathBuf,
+    snapshot: Value,
+    /// Compact JSON whose complete envelope must fit this reader limit; None retains the ordinary pretty format.
+    max_bytes: Option<usize>,
+    /// Told once the file is on disk, or why it isn't.
+    done: Option<Written>,
+    #[cfg(test)]
+    gate: Option<CommitGate>,
+}
+
 enum Write {
-    File {
-        path: PathBuf,
-        snapshot: Value,
-        /// Compact JSON whose complete envelope must fit this reader limit; None retains the ordinary pretty format.
-        max_bytes: Option<usize>,
-        /// Told once the file is on disk, or why it isn't.
-        done: Option<Written>,
-    },
+    File(FileWrite),
     /// Told once every write sent before it is done.
     Flush(Sender<()>),
 }
@@ -49,6 +73,8 @@ pub struct Snapshots {
     owner: RefCell<Host>,
     /// None when the writer thread couldn't start: writes are done in place then.
     writer: Option<Sender<Write>>,
+    #[cfg(test)]
+    next_gate: RefCell<Option<(String, CommitGate)>>,
 }
 
 impl Snapshots {
@@ -62,7 +88,11 @@ impl Snapshots {
             }
         };
         let seq = Cell::new(newest_seq(&dir));
-        Snapshots { dir, seq, owner: RefCell::new(Host::default()), writer }
+        Snapshots {
+            dir, seq, owner: RefCell::new(Host::default()), writer,
+            #[cfg(test)]
+            next_gate: RefCell::new(None),
+        }
     }
 
     /// The profile and session the snapshots are for now (from the latest caller's `_host`).
@@ -110,11 +140,25 @@ impl Snapshots {
     }
 
     async fn write_wait(&self, name: &str, body: Value, max_bytes: Option<usize>) -> std::io::Result<u64> {
+        self.enqueue(name, body, max_bytes)?.wait().await
+    }
+
+    /// Enqueues synchronously, with no cancellation point before `send`. Once this
+    /// returns, only the writer's actual result can establish whether it committed.
+    pub(super) fn enqueue(&self, name: &str, body: Value, max_bytes: Option<usize>) -> std::io::Result<PendingWrite> {
         let (done, written) = tokio::sync::oneshot::channel();
         let (seq, write) = self.stamped(name, body, Some(done), max_bytes)?;
         self.send(write)?;
-        written.await.map_err(|_| std::io::Error::other("the snapshot writer stopped"))??;
-        Ok(seq)
+        Ok(PendingWrite { seq, written })
+    }
+
+    #[cfg(test)]
+    pub(super) fn pause_next_commit(&self, name: &str) -> (tokio::sync::oneshot::Receiver<()>, Sender<()>) {
+        assert!(self.writer.is_some(), "this fixture needs the normal writer thread");
+        let (entered, waiting) = tokio::sync::oneshot::channel();
+        let (release, released) = channel();
+        *self.next_gate.borrow_mut() = Some((name.into(), CommitGate { entered, release: released }));
+        (waiting, release)
     }
 
     /// Snapshot `name`'s write: `body`'s fields in the envelope, with its `seq`.
@@ -131,7 +175,16 @@ impl Snapshots {
         snapshot.insert("seq".into(), json!(seq));
         snapshot.insert("at".into(), json!(kumi_common::time::now_ms()));
         snapshot.insert("owner".into(), json!({"profile": owner.profile_id, "session_id": owner.session_id, "pid": std::process::id()}));
-        Ok((seq, Write::File { path, snapshot: Value::Object(snapshot), max_bytes, done }))
+        #[cfg(test)]
+        let gate = {
+            let mut next = self.next_gate.borrow_mut();
+            if next.as_ref().is_some_and(|(target, _)| target == name) { next.take().map(|(_, gate)| gate) } else { None }
+        };
+        Ok((seq, Write::File(FileWrite {
+            path, snapshot: Value::Object(snapshot), max_bytes, done,
+            #[cfg(test)]
+            gate,
+        })))
     }
 
     /// To the writer thread; written in place only when there's none to take it.
@@ -140,10 +193,10 @@ impl Snapshots {
             Some(writer) => writer.send(write).err().map(|failed| failed.0),
             None => Some(write),
         };
-        if let Some(Write::File { path, snapshot, max_bytes, done }) = unsent {
-            let written = serialized(&snapshot, max_bytes).and_then(|bytes| replace(&path, &bytes));
+        if let Some(Write::File(mut file)) = unsent {
+            let written = write_file(&mut file);
             let failed = written.as_ref().err().map(|error| std::io::Error::new(error.kind(), error.to_string()));
-            if let Some(done) = done {
+            if let Some(done) = file.done {
                 let _ = done.send(written);
             }
             if let Some(error) = failed {
@@ -217,16 +270,16 @@ fn write_files(writes: Receiver<Write>) {
         let mut waiting = waiting.into_iter().peekable();
         while let Some(write) = waiting.next() {
             match write {
-                Write::File { path, snapshot, max_bytes, done } => {
-                    let superseded = done.is_none() && matches!(waiting.peek(), Some(Write::File { path: next, .. }) if *next == path);
+                Write::File(mut file) => {
+                    let superseded = file.done.is_none() && matches!(waiting.peek(), Some(Write::File(next)) if next.path == file.path);
                     if superseded {
                         continue;
                     }
-                    let written = serialized(&snapshot, max_bytes).and_then(|bytes| replace(&path, &bytes));
+                    let written = write_file(&mut file);
                     if let Err(error) = &written {
-                        say(&format!("kumi serve: {} not written: {error}", path.display()));
+                        say(&format!("kumi serve: {} not written: {error}", file.path.display()));
                     }
-                    if let Some(done) = done {
+                    if let Some(done) = file.done {
                         let _ = done.send(written);
                     }
                 }
@@ -236,6 +289,15 @@ fn write_files(writes: Receiver<Write>) {
             }
         }
     }
+}
+
+fn write_file(file: &mut FileWrite) -> std::io::Result<()> {
+    #[cfg(test)]
+    if let Some(gate) = file.gate.take() {
+        let _ = gate.entered.send(());
+        gate.release.recv_timeout(FLUSH).map_err(std::io::Error::other)?;
+    }
+    serialized(&file.snapshot, file.max_bytes).and_then(|bytes| replace(&file.path, &bytes))
 }
 
 /// A reader-bounded snapshot is compact; ordinary snapshots keep their readable format.

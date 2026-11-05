@@ -651,7 +651,7 @@ fn momentary(answer: &Value) -> bool {
     } else {
         content["code"].as_str().filter(|_| content["state"] == "refused")
     };
-    matches!(code, Some("leased" | "busy" | "not_connected" | "stale"))
+    matches!(code, Some("leased" | "busy" | "not_connected" | "stale" | "transport_running" | "render_busy" | "ears_missing"))
 }
 
 /// Writes the messages out, one line each, until told to close (or the host stops reading).

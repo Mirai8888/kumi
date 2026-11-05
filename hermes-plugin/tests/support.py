@@ -203,11 +203,13 @@ def requests(state_dir: Path) -> list[dict]:
 
 
 def host(test, settings: dict | None = None, *fixture_args: str, installed: bool = True, hook_timeout: float = 30.0,
-         daw_component: bool = True, hermes_config: dict | None = None, session_key: str = ""):
+         daw_component: bool = True, hermes_config: dict | None = None, session_key: str = "", ledger=None,
+         mirelo_key: str | None = None):
     """A plugin host as the tools see it, on a fresh plugin-data folder with the fixture runtime set up (unless
-    `installed` is false), a plugin folder whose kumi_release.json pins it, `hermes_config` as Hermes's own settings
-    (never this machine's), and `session_key` as the calling session's key (never this process's). Returns (host,
-    context, data folder); everything is cleaned up after `test`."""
+    `installed` is false), a plugin folder whose kumi_release.json pins it, `hermes_config` as Hermes's own settings,
+    `session_key` as the calling session's key, and `ledger` and `mirelo_key` as the credit ledger and Hermes's Mirelo
+    secret (never this machine's or this process's). Returns (host, context, data folder); everything is cleaned up
+    after `test`."""
     import tempfile
     folder, plugin = tempfile.TemporaryDirectory(), tempfile.TemporaryDirectory()
     test.addCleanup(folder.cleanup)
@@ -222,7 +224,8 @@ def host(test, settings: dict | None = None, *fixture_args: str, installed: bool
     return (module("tools").Host(ctx, runtimes, data_dir=lambda: data, pinned=lambda: VERSION,
                                  hook_timeout=lambda: hook_timeout, plugin_dir=Path(plugin.name),
                                  hermes_config=lambda: dict(hermes_config or {}),
-                                 session_key=lambda: session_key), ctx, data)
+                                 session_key=lambda: session_key, ledger=ledger, mirelo_key=lambda: mirelo_key),
+            ctx, data)
 
 
 def stopped(runtimes, data: Path, wait: float = 30.0) -> None:

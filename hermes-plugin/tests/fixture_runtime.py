@@ -33,6 +33,7 @@ import time
 VERSION = "1.24.66"
 PROTOCOL = "kumi-serve/1"
 MCP = "2025-11-25"
+RESOURCES = ("kumi://status", "kumi://focus", "kumi://history", "kumi://map")  # C2's, as #1047's kumi serve offers
 # The plan steps the fixture applies, as the real runtime names Kumi's tools (W1-REGISTRY: `{tool, input, as}`).
 STEPS = {"set_track_volume", "replace_sample"}
 SET = {
@@ -63,6 +64,8 @@ class Fixture:
         self.running = True
         self.since = now()
         self.seen_at: int | None = None  # the last look (connect or observe), as focus.json's project.seen_at
+        self.subscribed: set[str] = set()  # the resources the host subscribed to (C2)
+        self.map_revision: str | None = None
         self.slow = dict(item.split("=", 1) for item in options.slow)
         self.writing = threading.Lock()
         self.counting = threading.Lock()
@@ -112,12 +115,18 @@ class Fixture:
 
     def answer(self, method: str, params: dict) -> dict:
         if method == "initialize":
+            offered = {} if self.options.no_resources else {"resources": {"subscribe": True, "listChanged": False}}
             return {"protocolVersion": MCP, "serverInfo": {"name": "kumi-serve", "version": self.options.server_version},
-                    "capabilities": {"tools": {}}}
+                    "capabilities": {"tools": {}, **offered}}
         if method == "tools/list":
             return {"tools": [{"name": name, "inputSchema": {"type": "object"}} for name in TOOLS]}
         if method == "tools/call":
             return self.call(params["name"], dict(params.get("arguments") or {}))
+        if method in ("resources/subscribe", "resources/unsubscribe") and not self.options.no_resources:
+            if params.get("uri") not in RESOURCES:
+                raise LookupError(f"no resource {params.get('uri')!r}")
+            (self.subscribed.add if method == "resources/subscribe" else self.subscribed.discard)(params["uri"])
+            return {}
         raise LookupError(f"no method {method}")
 
     def call(self, name: str, args: dict) -> dict:
@@ -155,6 +164,24 @@ class Fixture:
             seq = self.next_seq()
             body = {"status": self.status, "focus": self.focus, "history": self.history_snapshot}[name]()
             self.record(f"{name}.json", {"schema": 1, "seq": seq, "at": now(), "owner": self.owner, **body})
+            self.landed(f"kumi://{name}")
+
+    def publish_map(self, revision: str) -> None:
+        """A scan's map (C3), as kumi serve ends one: the revision's file, then its pointer flips to it."""
+        self.record(f"map/{revision}.json", {
+            "schema": 1, "seq": self.next_seq(), "at": now(), "revision": revision, "made": now(), "points": [],
+            "groups": {}, "sounds": {sound["sound_id"]: {key: sound[key] for key in ("name", "kind", "class", "folder",
+                                                                                      "duration")} for sound in SOUNDS}})
+        pointer = self.state / "map" / "current"
+        pointer.with_name("current.tmp").write_text(f"{revision}\n", encoding="utf-8")
+        os.replace(pointer.with_name("current.tmp"), pointer)
+        self.map_revision = revision
+        self.landed("kumi://map")
+
+    def landed(self, uri: str) -> None:
+        """A resource's snapshot is on disk anew: a subscriber hears of it (notifications/resources/updated)."""
+        if uri in self.subscribed:
+            self.send({"jsonrpc": "2.0", "method": "notifications/resources/updated", "params": {"uri": uri}})
 
     def project(self) -> dict | None:
         return {"name": self.set["name"], "key": self.set["key"], "epoch": self.epoch} if self.connected else None
@@ -471,6 +498,8 @@ def listen_track(fixture: Fixture, args: dict, host: dict) -> dict:
 def job(fixture: Fixture, args: dict, host: dict) -> dict:
     if args.get("job_id") != "j-scan-1":
         return error("not_found", f"no job {args.get('job_id')!r}")
+    if fixture.map_revision != "r1":  # the scan has ended: its map is the current one
+        fixture.publish_map("r1")
     return {"state": "done", "progress": 1.0, "result": {"sounds": len(SOUNDS), "map_revision": "r1"}}
 
 
@@ -521,6 +550,7 @@ def main() -> None:
     parser.add_argument("--stderr-flood", type=int, default=0, help="bytes written to stderr on start")
     parser.add_argument("--close-stdout", action="store_true", help="close stdout after initialize, and stay")
     parser.add_argument("--ignore-eof", action="store_true", help="stay after stdin ends")
+    parser.add_argument("--no-resources", action="store_true", help="offer no resources, as kumi serve before #1047")
     parser.add_argument("--library-root", action="append", default=[])
     parser.add_argument("--listen-outcome", default="measured",
                         choices=["measured", "refused", "cancelled", "unsure", "unsure-with-media"])

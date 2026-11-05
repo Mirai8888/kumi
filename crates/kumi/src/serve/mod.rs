@@ -25,6 +25,7 @@ pub mod setup;
 pub mod snapshots;
 
 mod core;
+mod listen_track;
 
 use kumi_types::daw::DawId;
 use kumi_types::system::Env;

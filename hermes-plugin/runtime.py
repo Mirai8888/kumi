@@ -46,9 +46,13 @@ IDLE_AFTER = 15 * 60.0  # RESEARCH.md §3.1
 # How long a stop waits for an idle runtime to exit before ending it: within the 10 s Hermes's gateway gives a chat's
 # finalization, with the terminate's own wait after it.
 STOP_WAIT = 5.0
-# A track listen waits for the runtime's own deadline, which its preview gives (`deadline_seconds`: capture or render,
-# restore and measure), plus a margin. CC-2's A2: a whole number of seconds from 1 to 360 (a 60 s window's offline
-# render with restoring and measuring); a preview without one isn't approved, and no deadline is ever guessed.
+# A track listen waits for the runtime's own bounds, which its preview gives (CC-2's A2 and its clarification), plus a
+# margin: `prepare_seconds` to get a `compare_to` reference ready before anything plays (0 without one, else at most
+# 120), then `deadline_seconds` for the native call (capture or render, restore and measure: a whole number of seconds
+# from 1 to 360, a 60 s window's offline render with restoring and measuring). A preview without valid bounds isn't
+# approved, and no bound is ever guessed.
+TRACK_SECONDS_MAX = 60.0
+TRACK_PREPARE_MAX = 120
 TRACK_DEADLINE_MAX = 360
 TRACK_MARGIN = 30.0
 # How long a runtime stopped with work unsettled may take to settle it before it's ended: W1's bound for settling after
@@ -568,20 +572,23 @@ class Runtime:
         return self.data_dir / "state"
 
     def call(self, tool: str, args: dict, host: dict, *, timeout: float,
-             interrupted: Callable[[], bool] | None = None) -> dict:
+             interrupted: Callable[[], bool] | None = None, private: dict | None = None) -> dict:
         """Call one of the runtime's tools (C2: C1's names without `kumi_`), with Hermes's call identity in `_host`.
         Its answer's structured content, or Refused with the runtime's error. A key starting with `_` is the host's to
-        give (`_host`, and CC-13's `_mirelo`, which the runtime takes as the host's say-so): one in `args`, written by
-        the model, is dropped, never passed on (rgzm, #1007). With `interrupted`, the producer's Stop cancels the call
-        while it waits (Client.request)."""
+        give (`_host`, and what the producer approved, which the runtime takes as the host's say-so): one in `args`,
+        written by the model, is dropped, never passed on (rgzm, #1007). With `interrupted`, the producer's Stop
+        cancels the call while it waits (Client.request). `private` is the host's own (CC-2's `_listen`: the bounds a
+        track listen was approved with): added to this one request only, never logged, recorded or returned, and it
+        can't replace `_host`."""
         arguments = {key: value for key, value in args.items() if not (isinstance(key, str) and key.startswith("_"))}
+        hosts = {key: value for key, value in (private or {}).items() if isinstance(key, str) and key.startswith("_")}
         with self._lock:
             if self.closing:
                 raise Unavailable("not_running", "Kumi's runtime was stopping; kumi_connect starts it again. Nothing "
                                                  "was sent.")
             self.in_flight += 1
         try:
-            result = self.client.request("tools/call", {"name": tool, "arguments": {**arguments, "_host": host}},
+            result = self.client.request("tools/call", {"name": tool, "arguments": {**arguments, **hosts, "_host": host}},
                                          timeout=timeout, interrupted=interrupted)
         finally:
             with self._lock:

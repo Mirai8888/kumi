@@ -160,14 +160,18 @@ def launch_environment(environ: Mapping[str, str], windows: bool = os.name == "n
     return kept
 
 
-def serve_argv(install: Install, state_dir: Path, daw: str, library_roots: Iterable[str] = ()) -> list[str]:
+def serve_argv(install: Install, state_dir: Path, daw: str, library_roots: Iterable[str] = (),
+               media_roots: Iterable[str] = ()) -> list[str]:
     """`kumi serve`'s arguments (C2; W1-REGISTRY): its state folder, Kumi's transport home, the DAW, each sample folder
-    the producer approved (`--library-root`, the runtime's only grant to read them), and the ffmpeg they allowed at
-    setup while it's unchanged (`--tool ffmpeg=`, CC-10). Read at each start."""
+    the producer approved (`--library-root`, the runtime's only grant to read them), each folder of finished media it
+    may import or measure (`--media-root`: Hermes's generated audio, where other plugins' results land), and the ffmpeg
+    they allowed at setup while it's unchanged (`--tool ffmpeg=`, CC-10). Read at each start."""
     argv = [str(install.kumi), "serve", "--stdio", "--state-dir", str(state_dir), "--kumi-home", str(install.kumi_home),
             "--daw", daw]
     for root in library_roots:
         argv += ["--library-root", root]
+    for root in media_roots:
+        argv += ["--media-root", root]
     if ffmpeg := allowed_tool(install.ffmpeg):
         argv += ["--tool", f"ffmpeg={ffmpeg}"]
     return argv
@@ -654,7 +658,7 @@ class Runtimes:
         raise Unavailable("not_connected", "Kumi isn't connected to the DAW: call kumi_connect first.")
 
     def start(self, data_dir: Path, install: Install, daw: str, session_id: str | None, *, profile: str,
-              library_roots: Iterable[str] = ()) -> Runtime:
+              library_roots: Iterable[str] = (), media_roots: Iterable[str] = ()) -> Runtime:
         """The profile's runtime, started for `session_id` when none runs: this process takes the profile's state
         lock (CC-6), then the runtime is initialized and checked to be the pinned runtime (its name, version and
         protocol, before anything else is asked of it), and its snapshots are watched for C5's events. A runtime that
@@ -681,7 +685,8 @@ class Runtimes:
             try:
                 install.kumi_home.mkdir(parents=True, exist_ok=True)
                 holder: dict[str, Runtime] = {}
-                client = self._spawn(serve_argv(install, state, daw, library_roots), launch_environment(self._environ()),
+                client = self._spawn(serve_argv(install, state, daw, library_roots, media_roots),
+                                     launch_environment(self._environ()),
                                      cwd=str(data_dir), keep_fds=lock.keep(),
                                      on_exit=lambda reason: self._exited(holder))
                 runtime = Runtime(client, install, data_dir, daw, session_id, lock, profile)

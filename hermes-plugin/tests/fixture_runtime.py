@@ -542,6 +542,7 @@ def main() -> None:
     parser.add_argument("--close-stdout", action="store_true", help="close stdout after initialize, and stay")
     parser.add_argument("--ignore-eof", action="store_true", help="stay after stdin ends")
     parser.add_argument("--library-root", action="append", default=[])
+    parser.add_argument("--media-root", action="append", default=[])
     parser.add_argument("--listen-outcome", default="measured",
                         choices=["measured", "refused", "cancelled", "unsure", "unsure-with-media"])
     parser.add_argument("--listen-deadline", type=int, default=75,
